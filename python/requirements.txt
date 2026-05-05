@@ -1,0 +1,3 @@
+# tdxdata依赖
+requests>=2.25.0
+pandas>=1.3.0
