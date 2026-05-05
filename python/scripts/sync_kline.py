@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TDX 1分钟K线数据同步脚本 - 高并发版
-使用asyncio并发获取数据
+TDX 1分钟K线数据同步脚本
+支持全量同步和增量同步
 
 Usage:
-    python sync_kline.py --all              # 同步全市场
-    python sync_kline.py --code 000001      # 测试单只
+    # 首次全量同步（会覆盖现有数据，用--resume可断点续传）
+    python sync_kline.py --full
+
+    # 增量同步（只获取最新数据，追加到现有数据）
+    python sync_kline.py --incremental
+
+    # 单只股票测试
+    python sync_kline.py --code 000001
+
+    # 定时增量同步（建议crontab每5分钟运行一次）
+    # */5 * * * * cd /path/to && python sync_kline.py --incremental
 """
 
 import sys
 import os
 import json
 import time
-import signal
 import logging
 import argparse
 import asyncio
-from datetime import datetime
-from typing import List, Dict, Tuple
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
 
 import aiohttp
 
@@ -38,7 +46,7 @@ TDX_PORT = 8080
 TDX_BASE_URL = f"http://{TDX_HOST}:{TDX_PORT}"
 
 # 并发配置
-CONCURRENCY = 100  # 并发请求数
+CONCURRENCY = 50  # 并发请求数
 
 # ============== 日志配置 ==============
 logging.basicConfig(
@@ -78,6 +86,61 @@ def get_exchange(code: str) -> str:
         return 'sz'
 
 
+# ============== ClickHouse 工具 ==============
+
+class CHHelper:
+    """ClickHouse辅助工具"""
+
+    @staticmethod
+    def get_latest_time(ch_client: ClickHouseClient, code: str = None) -> Optional[datetime]:
+        """获取某股票或全局最新的K线时间"""
+        if code:
+            sql = f"SELECT max(time) FROM LingQuant.kline_1min WHERE code = '{code}'"
+        else:
+            sql = "SELECT max(time) FROM LingQuant.kline_1min"
+        result = ch_client._execute(sql)
+        if result and result.strip():
+            try:
+                return datetime.fromisoformat(result.strip().replace('+08:00', ''))
+            except:
+                pass
+        return None
+
+    @staticmethod
+    def get_code_latest_times(ch_client: ClickHouseClient) -> Dict[str, datetime]:
+        """获取所有股票的最新K线时间"""
+        sql = """
+        SELECT code, max(time) as latest
+        FROM LingQuant.kline_1min
+        GROUP BY code
+        """
+        result = ch_client._execute(sql)
+        if not result:
+            return {}
+
+        times = {}
+        for line in result.strip().split('\n')[1:]:  # 跳过表头
+            parts = line.split('\t')
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                try:
+                    times[parts[0]] = datetime.fromisoformat(parts[1].replace('+08:00', ''))
+                except:
+                    pass
+        return times
+
+    @staticmethod
+    def count_code(ch_client: ClickHouseClient, code: str) -> int:
+        """获取某股票的数据条数"""
+        sql = f"SELECT count() FROM LingQuant.kline_1min WHERE code = '{code}'"
+        result = ch_client._execute(sql)
+        if result:
+            try:
+                return int(result.strip())
+            except:
+                pass
+        return 0
+
+
 # ============== 异步获取函数 ==============
 
 async def fetch_kline(session: aiohttp.ClientSession, code: str, limit: int = 8000) -> Tuple[str, int, List[Dict]]:
@@ -94,18 +157,15 @@ async def fetch_kline(session: aiohttp.ClientSession, code: str, limit: int = 80
             if data.get('code') != 0:
                 return code, 0, []
 
-            # API返回结构: {"data": {"Count": N, "List": [...]}}
             items = data.get('data', {}).get('List', [])
             if not items:
                 return code, 0, []
 
-            # 解析数据
             records = []
             exchange = get_exchange(code)
 
             for item in items:
                 try:
-                    # API返回的价格单位是厘
                     close = int(item.get('Close', 0))
                     if close <= 0:
                         continue
@@ -134,37 +194,65 @@ async def fetch_kline(session: aiohttp.ClientSession, code: str, limit: int = 80
         return code, 0, []
 
 
+def filter_new_records(records: List[Dict], latest_time: Optional[datetime]) -> List[Dict]:
+    """过滤出比latest_time更新的记录"""
+    if latest_time is None:
+        return records
+
+    new_records = []
+    for r in records:
+        try:
+            rec_time = datetime.fromisoformat(r['time'].replace('+08:00', ''))
+            if rec_time > latest_time:
+                new_records.append(r)
+        except:
+            new_records.append(r)  # 解析失败时保留
+    return new_records
+
+
 # ============== 主同步逻辑 ==============
 
 async def worker(worker_id: int, codes: List[str], ch_client: ClickHouseClient,
-                progress: Dict, progress_lock: asyncio.Lock, sem: asyncio.Semaphore):
+                progress: Dict, progress_lock: asyncio.Lock, sem: asyncio.Semaphore,
+                code_latest_times: Dict[str, datetime]):
     """工作协程"""
     async with aiohttp.ClientSession() as session:
         for code in codes:
-            async with sem:  # 限流
+            async with sem:
                 code, count, records = await fetch_kline(session, code)
+
+                # 增量同步：只保留比本地更新的数据
+                latest_time = code_latest_times.get(code)
+                if latest_time:
+                    new_records = filter_new_records(records, latest_time)
+                    skip_count = len(records) - len(new_records)
+                else:
+                    new_records = records
+                    skip_count = 0
 
                 async with progress_lock:
                     progress["synced_codes"] += 1
                     progress["last_code"] = code
-                    if count > 0:
-                        progress["synced_records"] += count
+                    if len(new_records) > 0:
+                        progress["synced_records"] += len(new_records)
+                        progress["new_records"] += len(new_records)
+                    progress["skip_records"] += skip_count
 
-                    # 输出进度
-                    if progress["synced_codes"] % 500 == 0:
+                    if progress["synced_codes"] % 100 == 0:
                         pct = progress["synced_codes"] / progress["total_codes"] * 100
-                        logger.info(f"进度: {progress['synced_codes']}/{progress['total_codes']} ({pct:.1f}%), 已同步 {progress['synced_records']:,} 条")
+                        logger.info(f"进度: {progress['synced_codes']}/{progress['total_codes']} ({pct:.1f}%), "
+                                   f"新增 {progress['new_records']:,} 条, 跳过 {progress['skip_records']:,} 条")
 
-                if records:
+                if new_records:
                     try:
-                        ch_client.insert_kline_1min(records)
+                        ch_client.insert_kline_1min(new_records)
                     except Exception as e:
                         logger.error(f"写入 {code} 失败: {e}")
 
 
-async def sync_market(workers: int = CONCURRENCY):
+async def sync_market(incremental: bool = False, workers: int = CONCURRENCY):
     """同步全市场数据"""
-    # 获取股票列表（使用tdxdata）
+    # 获取股票列表
     logger.info("获取股票列表...")
     result = tdx.get_stock_list("all")
     if result.get('code') != 0:
@@ -182,15 +270,31 @@ async def sync_market(workers: int = CONCURRENCY):
         raise ConnectionError("ClickHouse连接失败")
     logger.info("ClickHouse连接成功")
 
+    # 获取本地最新数据时间（增量同步用）
+    code_latest_times = {}
+    if incremental:
+        logger.info("获取本地数据最新时间...")
+        code_latest_times = CHHelper.get_code_latest_times(ch_client)
+        logger.info(f"本地已有 {len(code_latest_times)} 只股票的数据")
+
+        # 显示几个示例
+        sample_codes = list(code_latest_times.keys())[:3]
+        for c in sample_codes:
+            logger.info(f"  {c}: {code_latest_times[c].strftime('%Y-%m-%d %H:%M')}")
+    else:
+        logger.info("全量同步模式：获取所有数据")
+
     # 进度
     progress = {
         "synced_codes": 0,
         "total_codes": len(codes),
         "synced_records": 0,
+        "new_records": 0,
+        "skip_records": 0,
         "last_code": ""
     }
     progress_lock = asyncio.Lock()
-    sem = asyncio.Semaphore(workers)  # 限制并发数
+    sem = asyncio.Semaphore(workers)
 
     # 分片
     chunk_size = max(1, len(codes) // workers)
@@ -199,10 +303,17 @@ async def sync_market(workers: int = CONCURRENCY):
     logger.info(f"使用 {workers} 个协程并发处理...")
 
     # 执行
-    tasks = [worker(i, chunk, ch_client, progress, progress_lock, sem) for i, chunk in enumerate(chunks)]
+    start_time = time.time()
+    tasks = [worker(i, chunk, ch_client, progress, progress_lock, sem, code_latest_times)
+             for i, chunk in enumerate(chunks)]
     await asyncio.gather(*tasks)
 
-    logger.info(f"同步完成: 共 {len(codes)} 只股票, {progress['synced_records']:,} 条记录")
+    elapsed = time.time() - start_time
+
+    logger.info(f"同步完成: 共 {len(codes)} 只股票")
+    logger.info(f"  新增记录: {progress['new_records']:,} 条")
+    logger.info(f"  跳过记录: {progress['skip_records']:,} 条")
+    logger.info(f"  耗时: {elapsed:.1f}秒")
 
 
 async def sync_single(code: str):
@@ -218,7 +329,34 @@ async def sync_single(code: str):
             inserted = ch_client.insert_kline_1min(records)
             logger.info(f"写入 {inserted} 条到ClickHouse")
 
-            count_result = ch_client.get_count(code)
+            count_result = CHHelper.count_code(ch_client, code)
+            latest = CHHelper.get_latest_time(ch_client, code)
+            logger.info(f"股票 {code} 在库中共有 {count_result} 条，最新时间: {latest}")
+
+
+async def sync_code_incremental(code: str):
+    """增量同步单只股票（测试用）"""
+    logger.info(f"增量同步单只股票: {code}")
+
+    ch_client = ClickHouseClient()
+    latest = CHHelper.get_latest_time(ch_client, code)
+    if latest:
+        logger.info(f"本地最新时间: {latest.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    async with aiohttp.ClientSession() as session:
+        code, count, records = await fetch_kline(session, code)
+        logger.info(f"获取到 {count} 条数据")
+
+        if records:
+            # 过滤新数据
+            new_records = filter_new_records(records, latest)
+            logger.info(f"新增数据: {len(new_records)} 条")
+
+            if new_records:
+                inserted = ch_client.insert_kline_1min(new_records)
+                logger.info(f"写入 {inserted} 条到ClickHouse")
+
+            count_result = CHHelper.count_code(ch_client, code)
             logger.info(f"股票 {code} 在库中共有 {count_result} 条")
 
 
@@ -227,8 +365,11 @@ async def sync_single(code: str):
 def main():
     parser = argparse.ArgumentParser(description='TDX 1分钟K线同步工具')
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--all', action='store_true', help='同步全量')
+    group.add_argument('--full', action='store_true', help='全量同步（获取全部数据）')
+    group.add_argument('--incremental', action='store_true', help='增量同步（只获取最新数据）')
     group.add_argument('--code', help='测试用：同步单只股票')
+    group.add_argument('--code-incremental', help='增量同步单只股票')
+
     parser.add_argument('--workers', type=int, default=CONCURRENCY, help=f'并发数 (默认{CONCURRENCY})')
 
     args = parser.parse_args()
@@ -236,8 +377,12 @@ def main():
     try:
         if args.code:
             asyncio.run(sync_single(args.code))
-        else:
-            asyncio.run(sync_market(args.workers))
+        elif args.code_incremental:
+            asyncio.run(sync_code_incremental(args.code_incremental))
+        elif args.full:
+            asyncio.run(sync_market(incremental=False, workers=args.workers))
+        elif args.incremental:
+            asyncio.run(sync_market(incremental=True, workers=args.workers))
     except KeyboardInterrupt:
         logger.info("用户中断")
     except Exception as e:
