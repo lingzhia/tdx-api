@@ -41,7 +41,8 @@ def get_kline(code: str, period: str = "day", limit: int = 100):
 
     Args:
         code: 股票代码
-        period: K线周期 minute1/5/15/30/hour/day/week/month
+        period: K线周期，必须使用完整名称: minute1/minute5/minute15/minute30/hour/day/week/month
+               注意: 不能使用缩写如 '5'、'5min' 等
         limit: 返回条数
 
     Returns:

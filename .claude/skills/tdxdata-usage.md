@@ -169,6 +169,8 @@ df = tdx.search_stock("茅台")
 | `week` | 周K线 |
 | `month` | 月K线 |
 
+**注意**: period参数必须使用完整名称，不能使用缩写。正确用法: `period='minute5'`，错误用法: `period='5'` 或 `period='5min'`。
+
 ---
 
 ## 返回类型
