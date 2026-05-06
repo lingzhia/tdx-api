@@ -241,13 +241,19 @@ async def worker(worker_id: int, codes: List[str], ch_client: ClickHouseClient,
                     if progress["synced_codes"] % 100 == 0:
                         pct = progress["synced_codes"] / progress["total_codes"] * 100
                         logger.info(f"进度: {progress['synced_codes']}/{progress['total_codes']} ({pct:.1f}%), "
-                                   f"新增 {progress['new_records']:,} 条, 跳过 {progress['skip_records']:,} 条")
+                                   f"新增 {progress['new_records']:,} 条, 跳过 {progress['skip_records']:,} 条, "
+                                   f"失败 {progress['failed_records']:,} 条")
 
                 if new_records:
                     try:
-                        ch_client.insert_kline_1min(new_records)
+                        inserted = ch_client.insert_kline_1min(new_records)
+                        if inserted < len(new_records):
+                            async with progress_lock:
+                                progress["failed_records"] += (len(new_records) - inserted)
                     except Exception as e:
                         logger.error(f"写入 {code} 失败: {e}")
+                        async with progress_lock:
+                            progress["failed_records"] += len(new_records)
 
 
 async def sync_market(incremental: bool = False, workers: int = CONCURRENCY):
@@ -291,6 +297,7 @@ async def sync_market(incremental: bool = False, workers: int = CONCURRENCY):
         "synced_records": 0,
         "new_records": 0,
         "skip_records": 0,
+        "failed_records": 0,
         "last_code": ""
     }
     progress_lock = asyncio.Lock()
@@ -313,6 +320,7 @@ async def sync_market(incremental: bool = False, workers: int = CONCURRENCY):
     logger.info(f"同步完成: 共 {len(codes)} 只股票")
     logger.info(f"  新增记录: {progress['new_records']:,} 条")
     logger.info(f"  跳过记录: {progress['skip_records']:,} 条")
+    logger.info(f"  失败记录: {progress['failed_records']:,} 条")
     logger.info(f"  耗时: {elapsed:.1f}秒")
 
 

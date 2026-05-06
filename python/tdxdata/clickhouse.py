@@ -71,27 +71,12 @@ class ClickHouseClient:
         if not data:
             return 0
 
-        # 构建VALUES子句
-        values_parts = []
-        for item in data:
-            time_val = item.get('time', '')
-            values_parts.append(
-                f"('{item.get('code', '')}', '{item.get('exchange', '')}', '{time_val}', "
-                f"{int(item.get('open', 0))}, {int(item.get('high', 0))}, {int(item.get('low', 0))}, "
-                f"{int(item.get('close', 0))}, {int(item.get('volume', 0))}, {int(item.get('amount', 0))})"
-            )
-
-        values_str = ','.join(values_parts)
-        query = (
-            f"INSERT INTO {CH_DATABASE}.{CH_TABLE_KLINE_1MIN} "
-            f"(code, exchange, time, open, high, low, close, volume, amount) "
-            f"VALUES {values_str}"
-        )
-
         # 分批插入，避免URL过长
         BATCH = 5000
+        RETRY = 3
         total = len(data)
         inserted = 0
+
         for i in range(0, total, BATCH):
             batch = data[i:i+BATCH]
             batch_query = (
@@ -104,11 +89,18 @@ class ClickHouseClient:
                     for item in batch
                 ])
             )
-            result = self._execute(batch_query)
-            if result is None:
-                print(f"Batch {i//BATCH} insert failed")
-                break
-            inserted += len(batch)
+
+            # 重试机制
+            for retry in range(RETRY):
+                result = self._execute(batch_query)
+                if result is not None:
+                    inserted += len(batch)
+                    break
+                elif retry < RETRY - 1:
+                    import time
+                    time.sleep(0.5 * (retry + 1))  # 递增延迟
+            else:
+                print(f"Batch {i//BATCH} insert failed after {RETRY} retries")
 
         return inserted
 
